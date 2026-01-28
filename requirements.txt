@@ -1,0 +1,8 @@
+streamlit
+pandas
+sqlalchemy
+pymysql
+openpyxl
+python-dotenv
+cachetools<6.0
+passlib[bcrypt]
