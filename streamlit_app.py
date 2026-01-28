@@ -36,33 +36,118 @@ with tab1:
         if not name or not website:
             st.warning("Company name and website cannot be empty.")
         else:
-            dup = check_internal_duplicate(name, website)
-            if dup:
-                st.error(f"Duplicate already added by {dup.added_by}")
+            dup = check_internal_duplicate(name, website, user)
+
+            if dup["is_duplicate"]:
+                status = "DUPLICATE_USER"
+                duplicate_owner = dup["original_user"]
             else:
                 hit = check_main_db(name, website)
                 status = classify_status(hit)
-                add_company(name, website, norm_name(name), norm_web(website), user, status)
-                st.success(f"Saved with status: {status}")
+                duplicate_owner = None
 
-# ---------------- BULK ----------------
+            add_company(
+                name=name,
+                website=website,
+                norm_name_val=norm_name(name),
+                norm_web_val=norm_web(website),
+                added_by=user,
+                status=status,
+                duplicate_owner=duplicate_owner
+            )
+
+            if status == "DUPLICATE_USER":
+                st.warning(f"⚠️ Already uploaded by {duplicate_owner}")
+            else:
+                st.success(f"✅ Saved with status: {status}")
+
+# ---------------- BULK UPLOAD ----------------
 with tab2:
-    file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
-    if file:
-        df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
+    st.subheader("📂 Bulk Upload Companies")
 
-        for _, row in df.iterrows():
-            name = row.get("name")
-            website = row.get("website")
-            if not name or not website or str(name).lower() == "nan" or str(website).lower() == "nan":
-                continue  # skip empty rows
+    uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
-            if not check_internal_duplicate(name, website):
-                hit = check_main_db(name, website)
-                status = classify_status(hit)
-                add_company(name, website, norm_name(name), norm_web(website), user, status)
+    if uploaded_file:
+        # Read file
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
 
-        st.success("Bulk upload completed")
+        df.columns = df.columns.str.lower().str.strip()
+
+        if "name" not in df.columns or "website" not in df.columns:
+            st.error("File must contain 'name' and 'website' columns")
+        else:
+            st.success(f"{len(df)} rows loaded. Click ANALYZE to check duplicates.")
+
+            if st.button("🔍 Analyze File"):
+                analysis_results = []
+
+                for _, row in df.iterrows():
+                    name = row.get("name")
+                    website = row.get("website")
+
+                    if not name or not website or str(name).lower() == "nan" or str(website).lower() == "nan":
+                        continue
+
+                    dup = check_internal_duplicate(name, website, user)
+
+                    if dup["is_duplicate"]:
+                        status = "DUPLICATE_USER"
+                        owner = dup["original_user"]
+                    else:
+                        hit = check_main_db(name, website)
+                        status = classify_status(hit)
+                        owner = None
+
+                    analysis_results.append({
+                        "name": name,
+                        "website": website,
+                        "status": status,
+                        "duplicate_owner": owner
+                    })
+
+                result_df = pd.DataFrame(analysis_results)
+                st.session_state.bulk_analysis = result_df
+
+    # ---------------- SHOW ANALYSIS ----------------
+    if "bulk_analysis" in st.session_state:
+        result_df = st.session_state.bulk_analysis
+
+        st.subheader("📊 Analysis Summary")
+        st.write(result_df["status"].value_counts())
+
+        st.subheader("🔁 Already Uploaded by Other Users")
+        st.dataframe(result_df[result_df["status"] == "DUPLICATE_USER"])
+
+        st.subheader("🗃 Already in Main Database")
+        st.dataframe(result_df[result_df["status"].str.startswith("DB_MATCH")])
+
+        st.subheader("🆕 Unique (Will Be Added)")
+        st.dataframe(result_df[result_df["status"] == "UNIQUE_APPROVED"])
+
+        # ---------------- CONFIRM INSERT ----------------
+        if st.button("✅ Confirm Upload to Staging"):
+            db = SessionLocal()
+
+            for _, row in result_df.iterrows():
+                entry = StagingCompany(
+                    name=row["name"],
+                    website=row["website"],
+                    norm_name=norm_name(row["name"]),
+                    norm_web=norm_web(row["website"]),
+                    added_by=user,
+                    status=row["status"],
+                    duplicate_owner=row["duplicate_owner"]
+                )
+                db.add(entry)
+
+            db.commit()
+            db.close()
+
+            st.success("Bulk upload completed successfully!")
+            del st.session_state.bulk_analysis
 
 # ---------------- MY UPLOADS ----------------
 with tab3:

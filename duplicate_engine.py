@@ -1,15 +1,31 @@
 from db import SessionLocal, StagingCompany
 from utils import norm_name, norm_web
 
-def check_internal_duplicate(name, website):
+def check_internal_duplicate(name, website, current_user):
+    n_name = norm_name(name)
+    n_web = norm_web(website)
+
     db = SessionLocal()
-    n_name, n_web = norm_name(name), norm_web(website)
-    row = db.query(StagingCompany).filter(
-        (StagingCompany.norm_name == n_name) |
-        (StagingCompany.norm_web == n_web)
+
+    match = db.query(StagingCompany).filter(
+        StagingCompany.norm_name == n_name,
+        StagingCompany.norm_web == n_web
     ).first()
+
     db.close()
-    return row
+
+    if match:
+        # If same user re-uploads, still duplicate but no need to blame themselves
+        owner = match.added_by
+        return {
+            "is_duplicate": True,
+            "original_user": owner
+        }
+
+    return {
+        "is_duplicate": False,
+        "original_user": None
+    }
 
 def classify_status(db_hit):
     if db_hit is None:

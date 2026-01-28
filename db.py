@@ -28,21 +28,25 @@ class StagingCompany(Base):
     norm_web = Column(String(255), index=True)
     added_by = Column(String(100))
     status = Column(String(50))
+    duplicate_owner = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
-def add_company(name, website, norm_name, norm_web, user, status):
+def add_company(name, website, norm_name_val, norm_web_val, added_by, status, duplicate_owner=None):
     db = SessionLocal()
-    db.add(StagingCompany(
+    obj = StagingCompany(
         name=name,
         website=website,
-        norm_name=norm_name,
-        norm_web=norm_web,
-        added_by=user,
-        status=status
-    ))
+        norm_name=norm_name_val,
+        norm_web=norm_web_val,
+        added_by=added_by,
+        status=status,
+        duplicate_owner=duplicate_owner
+    )
+    db.add(obj)
     db.commit()
     db.close()
+
     
 def delete_company(company_id):
     db = SessionLocal()
