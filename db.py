@@ -5,11 +5,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = f"mysql+pymysql://{os.getenv('STAGING_DB_USER')}:{os.getenv('STAGING_DB_PASSWORD')}@{os.getenv('STAGING_DB_HOST')}:{os.getenv('STAGING_DB_PORT')}/{os.getenv('STAGING_DB_NAME')}"
+DATABASE_URL = (
+    f"mysql+pymysql://{os.getenv('STAGING_DB_USER')}:"
+    f"{os.getenv('STAGING_DB_PASSWORD')}@"
+    f"{os.getenv('STAGING_DB_HOST')}:"
+    f"{os.getenv('STAGING_DB_PORT')}/"
+    f"{os.getenv('STAGING_DB_NAME')}"
+)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
 
 class User(Base):
     __tablename__ = "users"
@@ -18,6 +25,7 @@ class User(Base):
     password_hash = Column(String(255))
     role = Column(String(20), default="user")
     is_active = Column(Boolean, default=True)
+
 
 class StagingCompany(Base):
     __tablename__ = "staging_companies"
@@ -28,30 +36,27 @@ class StagingCompany(Base):
     norm_web = Column(String(255), index=True)
     added_by = Column(String(100))
     status = Column(String(50))
-    duplicate_owner = Column(String, nullable=True)
+    duplicate_owner = Column(String(100), nullable=True)
+
 
 Base.metadata.create_all(bind=engine)
 
-def add_company(name, website, norm_name_val, norm_web_val, added_by, status, duplicate_owner=None):
-    db = SessionLocal()
-    obj = StagingCompany(
-        name=name,
-        website=website,
-        norm_name=norm_name_val,
-        norm_web=norm_web_val,
-        added_by=added_by,
-        status=status,
-        duplicate_owner=duplicate_owner
-    )
-    db.add(obj)
-    db.commit()
-    db.close()
 
-    
-def delete_company(company_id):
+def add_company(**kwargs):
     db = SessionLocal()
-    obj = db.query(StagingCompany).filter(StagingCompany.id == company_id).first()
-    if obj:
-        db.delete(obj)
+    try:
+        db.add(StagingCompany(**kwargs))
         db.commit()
-    db.close()
+    finally:
+        db.close()
+
+
+def delete_company(company_id: int):
+    db = SessionLocal()
+    try:
+        obj = db.query(StagingCompany).filter_by(id=company_id).first()
+        if obj:
+            db.delete(obj)
+            db.commit()
+    finally:
+        db.close()

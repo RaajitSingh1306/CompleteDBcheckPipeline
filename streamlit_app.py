@@ -1,261 +1,218 @@
 import streamlit as st
 import pandas as pd
 from auth import require_login, logout_button
-from duplicate_engine import check_internal_duplicate, classify_status
-from db_check import check_main_db
-from db import add_company, SessionLocal, StagingCompany
+from duplicate_engine import check_internal_duplicate, classify_status, purge_user_duplicates
+from utils import clean_text
+from db_check import fetch_db_snapshot, check_main_db
+from db import add_company, SessionLocal, StagingCompany, delete_company
 from utils import norm_name, norm_web
 from export import export_excel, get_user_status_summary, get_user_upload_counts
 
-st.set_page_config("Company Validation Portal")
+st.set_page_config("Company Validation Portal", layout="wide")
 
+# ---------------- LOGIN ----------------
 user, role = require_login()
-st.sidebar.write(f"Logged in as {user}")
+st.sidebar.write(f"👤 Logged in as: {user}")
 logout_button()
 
+# ---------------- LOAD MAIN DB SNAPSHOT ONCE ----------------
+if "main_db" not in st.session_state:
+    st.session_state.main_db = fetch_db_snapshot()
+
+main_db_df = st.session_state.main_db
+
+# ---------------- SIDEBAR USER STATS ----------------
 st.sidebar.markdown("### 👥 Upload Contributions")
-
-user_counts = get_user_upload_counts()
-
-if user_counts:
-    for u, c in user_counts.items():
+counts = get_user_upload_counts()
+if counts:
+    for u, c in counts.items():
         st.sidebar.write(f"{u} — {c}")
 else:
     st.sidebar.write("No uploads yet")
 
+# ---------------- TABS ----------------
+tab1, tab2, tab3, tab4 = st.tabs(["Submit", "Bulk Upload", "My Uploads", "Admin Export"])
 
-tab1, tab2, tab3, tab4 = st.tabs(["Submit", "Bulk Upload", "Uploads", "Admin Export"])
-
-# ---------------- SUBMIT ----------------
+# =========================================================
+# TAB 1 — SUBMIT SINGLE COMPANY
+# =========================================================
 with tab1:
     st.subheader("Submit Company")
+
     name = st.text_input("Company Name")
     website = st.text_input("Website")
 
-    if st.button("Submit"):
+    if st.button("Submit Company"):
+        name = clean_text(name)
+        website = clean_text(website)
+
         if not name or not website:
-            st.warning("Company name and website cannot be empty.")
+            st.warning("Both fields required")
         else:
-            dup = check_internal_duplicate(name, website, user)
+            dup = check_internal_duplicate(name, website)
 
             if dup["is_duplicate"]:
                 status = "DUPLICATE_USER"
-                duplicate_owner = dup["original_user"]
+                owner = dup["original_user"]
+                st.warning(f"⚠️ Duplicate already uploaded by {owner}")
             else:
-                hit = check_main_db(name, website)
+                hit = check_main_db(name, website, main_db_df)
                 status = classify_status(hit)
-                duplicate_owner = None
-
-            add_company(
-                name=name,
-                website=website,
-                norm_name_val=norm_name(name),
-                norm_web_val=norm_web(website),
-                added_by=user,
-                status=status,
-                duplicate_owner=duplicate_owner
-            )
-
-            if status == "DUPLICATE_USER":
-                st.warning(f"⚠️ Already uploaded by {duplicate_owner}")
-            else:
+                owner = None
                 st.success(f"✅ Saved with status: {status}")
 
-# ---------------- BULK UPLOAD ----------------
+            add_company(
+                name=clean_text(name),
+                website=clean_text(website),
+                norm_name=norm_name(name),
+                norm_web=norm_web(website),
+                added_by=user,
+                status=status,
+                duplicate_owner=owner
+            )
+
+# =========================================================
+# TAB 2 — BULK UPLOAD + ANALYTICS
+# =========================================================
 with tab2:
     st.subheader("📂 Bulk Upload Companies")
 
     uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
     if uploaded_file:
-        # Read file
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-
+        df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
         df.columns = df.columns.str.lower().str.strip()
 
         if "name" not in df.columns or "website" not in df.columns:
             st.error("File must contain 'name' and 'website' columns")
         else:
-            st.success(f"{len(df)} rows loaded. Click ANALYZE to check duplicates.")
+            st.success(f"{len(df)} rows loaded")
 
             if st.button("🔍 Analyze File"):
-                analysis_results = []
+                results = []
+                progress = st.progress(0)
 
-                for _, row in df.iterrows():
-                    name = row.get("name")
-                    website = row.get("website")
+                for i, row in df.iterrows():
+                    name = clean_text(row["name"])
+                    website = clean_text(row["website"])
 
-                    if not name or not website or str(name).lower() == "nan" or str(website).lower() == "nan":
+                    # Skip invalid rows
+                    if not name or not website:
                         continue
 
-                    dup = check_internal_duplicate(name, website, user)
-
+                    dup = check_internal_duplicate(name, website)
                     if dup["is_duplicate"]:
                         status = "DUPLICATE_USER"
                         owner = dup["original_user"]
                     else:
-                        hit = check_main_db(name, website)
+                        hit = check_main_db(name, website, main_db_df)
                         status = classify_status(hit)
                         owner = None
 
-                    analysis_results.append({
+                    results.append({
                         "name": name,
                         "website": website,
                         "status": status,
                         "duplicate_owner": owner
                     })
 
-                result_df = pd.DataFrame(analysis_results)
-                st.session_state.bulk_analysis = result_df
+                    progress.progress((i + 1) / len(df))
 
-    # ---------------- SHOW ANALYSIS ----------------
-    if "bulk_analysis" in st.session_state:
-        result_df = st.session_state.bulk_analysis
+                st.session_state.bulk_results = pd.DataFrame(results)
 
-        st.subheader("📊 Analysis Summary")
-        st.write(result_df["status"].value_counts())
+    # ---- SHOW ANALYTICS ----
+    if "bulk_results" in st.session_state:
+        res = st.session_state.bulk_results
 
-        st.subheader("🔁 Already Uploaded by Other Users")
-        st.dataframe(result_df[result_df["status"] == "DUPLICATE_USER"])
+        st.subheader("📊 Status Breakdown")
+        st.bar_chart(res["status"].value_counts())
 
-        st.subheader("🗃 Already in Main Database")
-        st.dataframe(result_df[result_df["status"].str.startswith("DB_MATCH")])
+        st.subheader("🔁 Duplicates")
+        st.dataframe(res[res["status"] == "DUPLICATE_USER"])
 
-        st.subheader("🆕 Unique (Will Be Added)")
-        st.dataframe(result_df[result_df["status"] == "UNIQUE_APPROVED"])
+        st.subheader("🆕 Unique Entries")
+        st.dataframe(res[res["status"] == "UNIQUE"])
 
-        # ---------------- CONFIRM INSERT ----------------
         if st.button("✅ Confirm Upload to Staging"):
             db = SessionLocal()
+            try:
+                for _, row in res.iterrows():
+                    db.add(StagingCompany(
+                        name=clean_text(row["name"]),
+                        website=clean_text(row["website"]),
+                        norm_name=norm_name(row["name"]),
+                        norm_web=norm_web(row["website"]),
+                        added_by=user,
+                        status=row["status"],
+                        duplicate_owner=row["duplicate_owner"]
+                    ))
+                db.commit()
+                st.success("Bulk upload saved!")
+                del st.session_state.bulk_results
+            finally:
+                db.close()
 
-            for _, row in result_df.iterrows():
-                entry = StagingCompany(
-                    name=row["name"],
-                    website=row["website"],
-                    norm_name=norm_name(row["name"]),
-                    norm_web=norm_web(row["website"]),
-                    added_by=user,
-                    status=row["status"],
-                    duplicate_owner=row["duplicate_owner"]
-                )
-                db.add(entry)
-
-            db.commit()
-            db.close()
-
-            st.success("Bulk upload completed successfully!")
-            del st.session_state.bulk_analysis
-
-# ---------------- MY UPLOADS ----------------
+# =========================================================
+# TAB 3 — MY UPLOADS
+# =========================================================
 with tab3:
-    st.subheader("📄 My Uploaded Companies")
+    st.subheader("📄 Uploaded Companies")
 
     db = SessionLocal()
-    rows = db.query(StagingCompany).all() if role == "admin" else \
-           db.query(StagingCompany).filter(StagingCompany.added_by == user).all()
-    db.close()
+    try:
+        rows = db.query(StagingCompany).all() if role == "admin" else \
+               db.query(StagingCompany).filter_by(added_by=user).all()
+    finally:
+        db.close()
 
     if not rows:
         st.info("No uploads yet.")
     else:
-        # Header row
-        h1, h2, h3, h4, h5, h6 = st.columns([1,3,3,2,2,1])
-        h1.write("No.")
-        h2.write("Company Name")
-        h3.write("Website")
-        h4.write("Status")
-        h5.write("Added By")
-        h6.write("")
+        for r in rows:
+            col1, col2, col3, col4, col5 = st.columns([3,3,2,2,1])
+            col1.write(r.name)
+            col2.write(r.website)
+            col3.write(r.status)
+            col4.write(r.added_by)
 
-        for idx, r in enumerate(rows, start=1):
-            col1, col2, col3, col4, col5, col6 = st.columns([1,3,3,2,2,1])
+            if col5.button("🗑", key=f"del_{r.id}"):
+                delete_company(r.id)
+                st.rerun()
 
-            col1.write(idx)
-            col2.write(r.name)
-            col3.write(r.website)
-            col4.write(r.status)
-            col5.write(r.added_by)
+        # 👇 PURGE SECTION MUST BE INSIDE TAB
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 🧹 Clean My Duplicate Entries")
 
-            # Delete permission
-            if role == "admin" or r.added_by == user:
-                if col6.button("🗑", key=f"del_{r.id}"):
-                    from db import delete_company
-                    delete_company(r.id)
-                    st.rerun()
+        if st.sidebar.button("Remove My Duplicate Companies"):
+            removed = purge_user_duplicates(user)
+            st.sidebar.success(f"{removed} duplicate entries removed from your uploads.")
+            st.rerun()
 
-# ---------------- ADMIN EXPORT ----------------
+# =========================================================
+# TAB 4 — ADMIN EXPORT & ANALYTICS
+# =========================================================
 with tab4:
     if role != "admin":
         st.warning("Admin only")
     else:
-        st.subheader("📊 Staging Summary by User")
+        st.subheader("📊 Upload Summary by User")
         summary = get_user_status_summary()
 
-        if not summary:
-            st.info("No data yet.")
+        if summary:
+            st.dataframe(pd.DataFrame(summary).T.fillna(0).astype(int))
         else:
-            df_summary = (
-                pd.DataFrame(summary)
-                .fillna(0)
-                .astype(int)
-                .T
-                .sort_index()
-            )
+            st.info("No data yet")
 
-            # Optional: enforce column order
-            status_order = [
-                "UNIQUE",
-                "DB_MATCH_ACTIVE_N",
-                "DB_MATCH_INACTIVE_N",
-                "DB_MATCH_ACTIVE_Y",
-                "DB_MATCH_INACTIVE_Y"
-            ]
-            df_summary = df_summary.reindex(columns=status_order, fill_value=0)
+        st.subheader("📥 Export Data")
+        options = st.multiselect("Select statuses to export", [
+            "UNIQUE", "DB_MATCH_ACTIVE_N", "DB_MATCH_INACTIVE_N",
+            "DB_MATCH_ACTIVE_Y", "DB_MATCH_INACTIVE_Y"
+        ])
 
-            st.dataframe(df_summary, use_container_width=True)
-
-        st.subheader("📥 Select Data to Export")
-
-        # ---- Checkboxes ----
-        export_approved   = st.checkbox("Unique", True)
-        export_active_n   = st.checkbox("DB Match Active (deleted=N)")
-        export_inactive_n = st.checkbox("DB Match Inactive (deleted=N)")
-        export_active_y   = st.checkbox("DB Match Active (deleted=Y)")
-        export_inactive_y = st.checkbox("DB Match Inactive (deleted=Y)")
-
-        # ---- Build selected list ----
-        selected = []
-        if export_approved:
-            selected.append("UNIQUE")
-        if export_active_n:
-            selected.append("DB_MATCH_ACTIVE_N")
-        if export_inactive_n:
-            selected.append("DB_MATCH_INACTIVE_N")
-        if export_active_y:
-            selected.append("DB_MATCH_ACTIVE_Y")
-        if export_inactive_y:
-            selected.append("DB_MATCH_INACTIVE_Y")
-
-        # ---- Generate & Download ----
-        if st.button("Generate Excel Export"):
-            if not selected:
-                st.warning("Select at least one category")
+        if st.button("Generate Excel"):
+            path = export_excel(options)
+            if path:
+                with open(path, "rb") as f:
+                    st.download_button("Download Excel", f.read(), "export.xlsx")
             else:
-                file_path = export_excel(selected)
-
-                if file_path:
-                    with open(file_path, "rb") as f:
-                        file_bytes = f.read()
-
-                    st.download_button(
-                        "📥 Download Excel",
-                        data=file_bytes,
-                        file_name="company_export.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    st.success("Export ready")
-                else:
-                    st.info("No records found for selected categories")
+                st.info("No records found")
